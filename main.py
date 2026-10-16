@@ -1,702 +1,137 @@
-
-import math
-
+# main.py — 영화 유형 나누기: 속성을 골라 묶고, 묶음 수도 바꿔 가며 정한다
 import streamlit as st
+import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-
-from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
+st.set_page_config(page_title="영화 유형 나누기", page_icon="🎬", layout="wide")
+st.title("🎬 영화 유형 나누기")
+st.caption("정답 열 없이, 내가 고른 속성이 비슷한 영화끼리 묶습니다.")
 
-DATA_URL = (
-    "https://raw.githubusercontent.com/"
-    "it-teacher-go/data-share-/main/kobis_movies.csv"
-)
-
-APP_TITLE = "🎬 영화 유형 나누기"
-
-st.set_page_config(
-    page_title="영화 유형 나누기",
-    page_icon="🎬",
-    layout="wide",
-)
-
-FEATURE_LABELS = {
-    "log_first_scrn": "개봉 초기 스크린 수 (로그)",
-    "log_total_audi": "누적 관객 수 (로그)",
-    "days_in_top10": "10위권 일수",
-    "long_run_index": "롱런 지수",
-}
-
-CIRCLE_LABELS = [
-    "㉮", "㉯", "㉰", "㉱", "㉲", "㉳", "㉴"
-]
+MOVIES = "https://raw.githubusercontent.com/it-teacher-go/data-share-/main/kobis_movies.csv"
+기호 = ["㉮", "㉯", "㉰", "㉱", "㉲", "㉳", "㉴"]          # 묶음 번호 대신 사용하는 표시
+속성 = ["스크린 수(로그)", "누적 관객(로그)", "10위권 일수", "롱런 지수"]
+원래단위 = ["스크린 수", "누적 관객", "10위권 일수", "롱런 지수"]
 
 
-@st.cache_data(show_spinner="영화 데이터를 불러오는 중입니다...")
+@st.cache_data
 def load_data():
-    df = pd.read_csv(DATA_URL, encoding="utf-8")
-
-    required = [
-        "movieCd",
-        "movieNm",
-        "openDt",
-        "genre",
-        "nation",
-        "first_scrn",
-        "first_show",
-        "first_date",
-        "peak",
-        "first_week_audi",
-        "total_audi",
-        "days_in_top10",
-    ]
-
-    missing = [
-        col for col in required
-        if col not in df.columns
-    ]
-
-    if missing:
-        raise ValueError(
-            "데이터에 필요한 열이 없습니다: "
-            + ", ".join(missing)
-        )
-
-    return df
+    df = pd.read_csv(MOVIES, dtype={"movieCd": str})
+    df = df.sort_values("movieCd").reset_index(drop=True)
+    전체편수 = len(df)
+    # 네 속성을 만들 수 없는 영화는 뺀다: 값이 없거나 첫 주 관객이 0인 행
+    쓸열 = ["first_scrn", "total_audi", "days_in_top10", "first_week_audi"]
+    df = df.dropna(subset=쓸열 + ["movieNm"])
+    df = df[(df["first_scrn"] > 0) & (df["total_audi"] > 0) & (df["first_week_audi"] > 0)]
+    df = df.reset_index(drop=True)
+    return df, 전체편수
 
 
-def prepare_data(raw):
-    df = raw.copy()
+df, 전체편수 = load_data()
 
-    numeric_cols = [
-        "first_scrn",
-        "first_week_audi",
-        "total_audi",
-        "days_in_top10",
-    ]
+# 네 가지 속성을 만든다. 숫자 차이가 너무 큰 둘은 상용로그를 취한다
+df["스크린 수"] = df["first_scrn"]
+df["누적 관객"] = df["total_audi"]
+df["10위권 일수"] = df["days_in_top10"]
+df["롱런 지수"] = (df["total_audi"] / df["first_week_audi"]).clip(upper=20)   # 20을 넘으면 20으로
+df["스크린 수(로그)"] = np.log10(df["first_scrn"])
+df["누적 관객(로그)"] = np.log10(df["total_audi"])
 
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce",
-        )
+st.info(f"전체 {전체편수:,}편 가운데 네 속성을 모두 만들 수 있는 {len(df):,}편으로 묶었습니다.")
 
-    # 롱런 지수 = 누적 관객 수 / 첫 주 관객 수
-    df["long_run_index"] = (
-        df["total_audi"]
-        / df["first_week_audi"].where(
-            df["first_week_audi"] > 0
-        )
-    )
-
-    # 롱런 지수가 20을 넘으면 20으로 제한
-    df["long_run_index"] = (
-        df["long_run_index"].clip(upper=20)
-    )
-
-    # 스크린 수와 누적 관객 수에 상용로그 적용
-    df["log_first_scrn"] = (
-        df["first_scrn"]
-        .where(df["first_scrn"] > 0)
-        .map(
-            lambda x: (
-                math.log10(x)
-                if pd.notna(x)
-                else float("nan")
-            )
-        )
-    )
-
-    df["log_total_audi"] = (
-        df["total_audi"]
-        .where(df["total_audi"] > 0)
-        .map(
-            lambda x: (
-                math.log10(x)
-                if pd.notna(x)
-                else float("nan")
-            )
-        )
-    )
-
-    feature_cols = list(FEATURE_LABELS.keys())
-
-    usable = df.dropna(
-        subset=feature_cols + ["movieNm"]
-    ).copy()
-
-    # 필수 값이 없거나 0 이하인 영화 제외
-    usable = usable[
-        (usable["first_scrn"] > 0)
-        & (usable["total_audi"] > 0)
-        & (usable["first_week_audi"] > 0)
-    ]
-
-    return df, usable
-
-
-def fit_clusters(df, features, k):
-    scaler = StandardScaler()
-
-    X = scaler.fit_transform(df[features])
-
-    model = KMeans(
-        n_clusters=k,
-        random_state=42,
-        n_init=10,
-    )
-
-    labels = model.fit_predict(X)
-
-    out = df.copy()
-    out["_cluster_raw"] = labels
-
-    # 평균 누적 관객이 많은 군집부터 ㉮, ㉯, ㉰ 순서로 표시
-    order = (
-        out.groupby("_cluster_raw")["total_audi"]
-        .mean()
-        .sort_values(ascending=False)
-        .index.tolist()
-    )
-
-    name_map = {
-        raw_label: CIRCLE_LABELS[i]
-        for i, raw_label in enumerate(order)
-    }
-
-    out["군집"] = out["_cluster_raw"].map(name_map)
-
-    return out, X
-
-
-st.title(APP_TITLE)
-
-st.caption(
-    "정답 범주 없이 흥행 기록의 유사성을 바탕으로 "
-    "영화를 묶는 비지도학습 실습입니다."
-)
-
-with st.expander("이 앱의 분석 방법", expanded=False):
-    st.markdown(
-        """
-        - **사용 속성:** 개봉 초기 스크린 수,
-          누적 관객 수, 10위권 일수, 롱런 지수
-        - **로그 변환:** 스크린 수와 누적 관객 수에
-          상용로그를 적용합니다.
-        - **롱런 지수:** 누적 관객 수를 첫 주 관객 수로
-          나눈 값이며, 20을 넘으면 20으로 제한합니다.
-        - **표준화:** 선택한 속성을 평균 0, 표준편차 1의
-          척도로 바꾼 뒤 K-means를 실행합니다.
-        - **해석 주의:** 군집은 작품성이나 고정된 등급이
-          아니라, 선택한 흥행 기록에서 나타난 유사성입니다.
-        """
-    )
-
-
-# 데이터 불러오기
-try:
-    raw_data = load_data()
-    all_data, data = prepare_data(raw_data)
-
-except Exception as exc:
-    st.error("데이터를 불러오거나 처리하지 못했습니다.")
-    st.exception(exc)
-
-    st.info(
-        "인터넷 연결과 데이터 URL을 확인한 뒤 "
-        "앱을 다시 실행해 주세요."
-    )
-
+고른속성 = st.multiselect("묶는 데 사용할 속성 (둘 이상)", 속성, default=속성)
+if len(고른속성) < 2:
+    st.warning("속성을 둘 이상 골라 주세요.")
     st.stop()
 
-
-# 데이터 요약
-c1, c2, c3 = st.columns(3)
-
-c1.metric(
-    "원본 데이터 편수",
-    f"{len(all_data):,}편",
-)
-
-c2.metric(
-    "분석 가능한 편수",
-    f"{len(data):,}편",
-)
-
-c3.metric(
-    "분석에서 제외된 편수",
-    f"{len(all_data) - len(data):,}편",
-)
-
-st.caption(
-    "분석 가능 편수는 필수 속성이 있고, 첫 주 관객·"
-    "스크린 수·누적 관객이 양수인 영화의 수입니다."
-)
+Xs = StandardScaler().fit_transform(df[고른속성])          # 고른 속성을 표준화한다
+k = st.slider("몇 묶음으로 나눌까요", 2, 7, 3)
 
 
-# 1. 군집 설정
-st.subheader("1. 군집 설정")
-
-left, right = st.columns([2, 1])
-
-with left:
-    selected_features = st.multiselect(
-        "군집을 만드는 속성 선택 (최소 2개)",
-        options=list(FEATURE_LABELS.keys()),
-        default=list(FEATURE_LABELS.keys()),
-        format_func=lambda x: FEATURE_LABELS[x],
-    )
-
-with right:
-    k = st.selectbox(
-        "군집 수 k",
-        options=[2, 3, 4, 5, 6, 7],
-        index=1,
-    )
+def 나누기(개수):
+    """표준화한 값을 k-평균으로 나눈다. 난수를 고정해 다시 실행해도 결과가 같다."""
+    return KMeans(n_clusters=개수, n_init=10, random_state=42).fit(Xs)
 
 
-if len(selected_features) < 2:
-    st.warning(
-        "군집을 만들 속성을 두 개 이상 선택해 주세요."
-    )
-    st.stop()
+모델 = 나누기(k)
+번호 = 모델.labels_
 
-if len(data) <= k:
-    st.error(
-        f"분석 가능한 영화가 {len(data)}편이므로 "
-        f"k={k}로 군집을 만들 수 없습니다."
-    )
-    st.stop()
+# 누적 관객 평균이 큰 묶음부터 ㉮·㉯·㉰ 순으로 표시한다
+순서 = pd.Series(df["누적 관객"].to_numpy()).groupby(번호).mean().sort_values(ascending=False).index
+자리 = {g: i for i, g in enumerate(순서)}
+df["묶음"] = [기호[자리[g]] for g in 번호]
 
+st.subheader("묶음 지도 · 2차원")
+c1, c2 = st.columns(2)
+x축 = c1.selectbox("가로축", 고른속성, index=0)
+y축 = c2.selectbox("세로축", 고른속성, index=min(1, len(고른속성) - 1))
+fig = px.scatter(df, x=x축, y=y축, color="묶음", hover_name="movieNm",
+                 category_orders={"묶음": 기호[:k]})
+fig.update_traces(marker=dict(size=9, opacity=0.8))
+fig.update_layout(height=460)
+st.plotly_chart(fig, width="stretch")
+st.caption("점 하나가 영화 한 편입니다. 축을 바꿔 보면 묶음이 나뉘는 축과 섞이는 축이 보입니다.")
 
-clustered, X_scaled = fit_clusters(
-    data,
-    selected_features,
-    k,
-)
-
-display_order = [
-    label
-    for label in CIRCLE_LABELS
-    if label in clustered["군집"].unique()
-]
-
-st.success(
-    f"전체 {len(all_data):,}편 중 "
-    f"{len(clustered):,}편을 분석했습니다. "
-    f"선택한 속성 {len(selected_features)}개로 "
-    f"{k}개 군집을 만들었습니다."
-)
-
-
-# 2. 2차원 산점도
-st.subheader("2. 2차원 산점도")
-
-axis1, axis2 = st.columns(2)
-
-with axis1:
-    x_feature = st.selectbox(
-        "가로축",
-        options=selected_features,
-        index=0,
-        format_func=lambda x: FEATURE_LABELS[x],
-        key="x_feature",
-    )
-
-with axis2:
-    y_default = min(1, len(selected_features) - 1)
-
-    y_feature = st.selectbox(
-        "세로축",
-        options=selected_features,
-        index=y_default,
-        format_func=lambda x: FEATURE_LABELS[x],
-        key="y_feature",
-    )
-
-
-fig2 = px.scatter(
-    clustered,
-    x=x_feature,
-    y=y_feature,
-    color="군집",
-    category_orders={"군집": display_order},
-    hover_name="movieNm",
-    hover_data={
-        "first_scrn": ":,.0f",
-        "total_audi": ":,.0f",
-        "days_in_top10": ":,.0f",
-        "long_run_index": ":.2f",
-        "_cluster_raw": False,
-        "군집": True,
-    },
-    labels={
-        x_feature: FEATURE_LABELS[x_feature],
-        y_feature: FEATURE_LABELS[y_feature],
-    },
-    title="영화별 흥행 기록과 군집",
-)
-
-fig2.update_traces(
-    marker={
-        "size": 7,
-        "opacity": 0.75,
-    }
-)
-
-fig2.update_layout(
-    legend_title_text="군집",
-    height=560,
-)
-
-st.plotly_chart(
-    fig2,
-    use_container_width=True,
-)
-
-
-# 3. 3차원 산점도
-st.subheader("3. 3차원 산점도")
-
-if len(selected_features) < 3:
-    st.info(
-        "3차원 산점도를 보려면 군집 속성을 "
-        "세 개 이상 선택해 주세요."
-    )
-
+st.subheader("묶음 지도 · 3차원")
+if len(고른속성) < 3:
+    st.info("속성을 셋 이상 고르면 3차원 그림이 표시됩니다.")
 else:
-    xyz = st.columns(3)
+    d1, d2, d3 = st.columns(3)
+    x3 = d1.selectbox("x축", 고른속성, index=0, key="x3")
+    y3 = d2.selectbox("y축", 고른속성, index=1, key="y3")
+    z3 = d3.selectbox("z축", 고른속성, index=2, key="z3")
+    fig3 = px.scatter_3d(df, x=x3, y=y3, z=z3, color="묶음", hover_name="movieNm",
+                         category_orders={"묶음": 기호[:k]})
+    fig3.update_traces(marker=dict(size=2, opacity=0.7))
+    fig3.update_layout(height=560, legend=dict(orientation="h"))
+    st.plotly_chart(fig3, width="stretch")
+    st.caption("마우스로 끌면 돌아갑니다. 점에 마우스를 올리면 제목이 보입니다.")
 
-    with xyz[0]:
-        z_x = st.selectbox(
-            "3D X축",
-            selected_features,
-            index=0,
-            format_func=lambda x: FEATURE_LABELS[x],
-            key="z_x",
-        )
+st.subheader("묶음별 편수와 네 속성의 평균")
+요약 = df.groupby("묶음")[원래단위].mean().round(2)
+요약.insert(0, "편수", df.groupby("묶음").size())
+요약 = 요약.reindex(기호[:k])
+st.dataframe(요약, width="stretch", column_config={
+    "편수": st.column_config.NumberColumn("편수", format="%,d편"),
+    "스크린 수": st.column_config.NumberColumn("스크린 수", format="%.1f개"),
+    "누적 관객": st.column_config.NumberColumn("누적 관객", format="%,.0f명"),
+    "10위권 일수": st.column_config.NumberColumn("10위권 일수", format="%.1f일"),
+    "롱런 지수": st.column_config.NumberColumn("롱런 지수", format="%.2f배"),
+})
+st.caption("평균은 로그를 취하기 전의 원래 단위입니다. 롱런 지수는 누적 관객을 첫 주 관객으로 나눈 값이고 20에서 잘랐습니다.")
 
-    with xyz[1]:
-        z_y = st.selectbox(
-            "3D Y축",
-            selected_features,
-            index=1,
-            format_func=lambda x: FEATURE_LABELS[x],
-            key="z_y",
-        )
+st.subheader("묶음마다 관객이 많은 다섯 편")
+열 = st.columns(k)
+for i, 이름 in enumerate(기호[:k]):
+    묶음 = df[df["묶음"] == 이름].sort_values("누적 관객", ascending=False).head(5)
+    열[i].markdown(f"**{이름} 묶음 ({len(df[df['묶음'] == 이름]):,}편)**")
+    열[i].dataframe(pd.DataFrame({"영화": 묶음["movieNm"].to_numpy(),
+                                "누적 관객": 묶음["누적 관객"].to_numpy()}),
+                   width="stretch", hide_index=True,
+                   column_config={"누적 관객": st.column_config.NumberColumn("누적 관객", format="%,d명")})
 
-    with xyz[2]:
-        z_z = st.selectbox(
-            "3D Z축",
-            selected_features,
-            index=2,
-            format_func=lambda x: FEATURE_LABELS[x],
-            key="z_z",
-        )
+# 여기부터 ③ — 묶음 수를 몇으로 할지 정하는 화면
+st.divider()
+st.subheader("묶음 수는 몇이 좋을까")
 
-    fig3 = px.scatter_3d(
-        clustered,
-        x=z_x,
-        y=z_y,
-        z=z_z,
-        color="군집",
-        category_orders={"군집": display_order},
-        hover_name="movieNm",
-        hover_data={
-            "total_audi": ":,.0f",
-            "first_scrn": ":,.0f",
-            "days_in_top10": ":,.0f",
-        },
-        labels={
-            z_x: FEATURE_LABELS[z_x],
-            z_y: FEATURE_LABELS[z_y],
-            z_z: FEATURE_LABELS[z_z],
-        },
-        title="3차원 영화 군집",
-    )
+# 고른 속성으로 다시 계산한다. 묶음 안에서 점들이 중심에서 떨어진 거리의 제곱을 모두 더한 값(k=1~7)
+합 = pd.DataFrame({"묶음 수": list(range(1, 8)),
+                   "거리 제곱의 합": [round(float(나누기(개수).inertia_), 1) for 개수 in range(1, 8)]})
+# 바로 앞 묶음 수에서 줄어든 크기. 맨 첫 줄은 비교할 앞 값이 없다
+합["앞보다 줄어든 값"] = ["—" if pd.isna(v) else f"{v:,.1f}" for v in -합["거리 제곱의 합"].diff()]
 
-    fig3.update_traces(
-        marker={
-            "size": 3,
-            "opacity": 0.8,
-        }
-    )
+꺾은선 = px.line(합, x="묶음 수", y="거리 제곱의 합", markers=True)
+꺾은선.add_vline(x=k, line_dash="dash", annotation_text=f"지금 고른 묶음 수 {k}")
+꺾은선.update_layout(height=380, xaxis_title="묶음 수(k)", yaxis_title="묶음 안 거리 제곱의 합")
+st.plotly_chart(꺾은선, width="stretch")
+st.caption("묶음 수를 늘리면 값은 반드시 줄어듭니다. 줄어드는 폭이 크게 꺾이는 자리를 찾습니다.")
 
-    fig3.update_layout(
-        height=650,
-        legend_title_text="군집",
-    )
+st.dataframe(합, width="stretch", hide_index=True)
 
-    st.plotly_chart(
-        fig3,
-        use_container_width=True,
-    )
-
-
-# 4. 군집별 요약표
-st.subheader("4. 군집별 요약")
-
-summary = (
-    clustered.groupby("군집")
-    .agg(
-        편수=("movieNm", "size"),
-        스크린_수_평균=("first_scrn", "mean"),
-        누적_관객_평균=("total_audi", "mean"),
-        days_in_top10_avg=("days_in_top10", "mean"),
-        롱런_지수_평균=("long_run_index", "mean"),
-    )
-    .reindex(display_order)
-    .reset_index()
-)
-
-summary = summary.rename(
-    columns={
-        "군집": "군집",
-        "스크린_수_평균": "스크린 수 평균",
-        "누적_관객_평균": "누적 관객 평균",
-        "days_in_top10_avg": "10위권 일수 평균",
-        "롱런_지수_평균": "롱런 지수 평균",
-    }
-)
-
-summary["스크린 수 평균"] = (
-    summary["스크린 수 평균"].round(1)
-)
-
-summary["누적 관객 평균"] = (
-    summary["누적 관객 평균"].round(0)
-)
-
-summary["10위권 일수 평균"] = (
-    summary["10위권 일수 평균"].round(1)
-)
-
-summary["롱런 지수 평균"] = (
-    summary["롱런 지수 평균"].round(2)
-)
-
-st.dataframe(
-    summary,
-    use_container_width=True,
-    hide_index=True,
-)
-
-
-# 5. 군집별 관객 수 상위 영화
-st.subheader("5. 군집별 누적 관객 상위 영화 5편")
-
-for cluster_name in display_order:
-    group = (
-        clustered[clustered["군집"] == cluster_name]
-        .sort_values("total_audi", ascending=False)
-        .head(5)
-    )
-
-    cluster_count = len(
-        clustered[clustered["군집"] == cluster_name]
-    )
-
-    with st.expander(
-        f"{cluster_name} 군집 — {cluster_count:,}편",
-        expanded=True,
-    ):
-        show_cols = [
-            col
-            for col in [
-                "movieNm",
-                "openDt",
-                "genre",
-                "nation",
-                "first_scrn",
-                "total_audi",
-                "days_in_top10",
-                "long_run_index",
-            ]
-            if col in group.columns
-        ]
-
-        top = group[show_cols].rename(
-            columns={
-                "movieNm": "영화 제목",
-                "openDt": "개봉일",
-                "genre": "장르",
-                "nation": "국가",
-                "first_scrn": "개봉 초기 스크린 수",
-                "total_audi": "누적 관객",
-                "days_in_top10": "10위권 일수",
-                "long_run_index": "롱런 지수",
-            }
-        ).copy()
-
-        if "누적 관객" in top.columns:
-            top["누적 관객"] = top["누적 관객"].map(
-                lambda x: f"{x:,.0f}"
-            )
-
-        if "개봉 초기 스크린 수" in top.columns:
-            top["개봉 초기 스크린 수"] = (
-                top["개봉 초기 스크린 수"].map(
-                    lambda x: f"{x:,.0f}"
-                )
-            )
-
-        if "롱런 지수" in top.columns:
-            top["롱런 지수"] = top["롱런 지수"].map(
-                lambda x: f"{x:.2f}"
-            )
-
-        st.dataframe(
-            top,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# 6. 엘보우 기법
-st.subheader("6. 엘보우 기법 — 적절한 군집 수 찾기")
-
-st.write(
-    "현재 선택한 속성으로 k=1부터 7까지 군집 내 "
-    "제곱합을 계산합니다. 값이 크게 줄다가 "
-    "감소폭이 작아지는 지점을 살펴보세요."
-)
-
-scaler_elbow = StandardScaler()
-
-X_elbow = scaler_elbow.fit_transform(
-    data[selected_features]
-)
-
-max_k = min(7, len(data) - 1)
-
-inertias = []
-
-for candidate_k in range(1, max_k + 1):
-    model = KMeans(
-        n_clusters=candidate_k,
-        random_state=42,
-        n_init=10,
-    )
-
-    model.fit(X_elbow)
-    inertias.append(float(model.inertia_))
-
-
-elbow_df = pd.DataFrame(
-    {
-        "군집 수 k": list(range(1, max_k + 1)),
-        "거리 제곱의 합": inertias,
-    }
-)
-
-elbow_fig = go.Figure()
-
-elbow_fig.add_trace(
-    go.Scatter(
-        x=elbow_df["군집 수 k"],
-        y=elbow_df["거리 제곱의 합"],
-        mode="lines+markers",
-        name="거리 제곱의 합",
-    )
-)
-
-elbow_fig.add_vline(
-    x=k,
-    line_dash="dash",
-    annotation_text=f"현재 k={k}",
-)
-
-elbow_fig.update_layout(
-    xaxis_title="군집 수 k",
-    yaxis_title="군집 내 거리 제곱의 합",
-    height=430,
-)
-
-st.plotly_chart(
-    elbow_fig,
-    use_container_width=True,
-)
-
-
-# 감소량은 이전 k의 값 - 현재 k의 값으로 계산
-elbow_df["앞보다 줄어든 값"] = (
-    elbow_df["거리 제곱의 합"].shift(1)
-    - elbow_df["거리 제곱의 합"]
-)
-
-elbow_df.loc[0, "앞보다 줄어든 값"] = None
-
-elbow_display = elbow_df.copy()
-
-elbow_display["거리 제곱의 합"] = (
-    elbow_display["거리 제곱의 합"].round(2)
-)
-
-elbow_display["앞보다 줄어든 값"] = (
-    elbow_display["앞보다 줄어든 값"].round(2)
-)
-
-st.dataframe(
-    elbow_display,
-    use_container_width=True,
-    hide_index=True,
-)
-
-
-# 7. 실루엣 점수
-if (
-    1 < k < len(data)
-    and clustered["_cluster_raw"].nunique() > 1
-):
-    try:
-        score = silhouette_score(
-            X_scaled,
-            clustered["_cluster_raw"],
-        )
-
-        st.metric(
-            "현재 k의 실루엣 점수",
-            f"{score:.3f}",
-        )
-
-        st.caption(
-            "실루엣 점수는 -1~1 범위이며 1에 가까울수록 "
-            "군집이 서로 잘 분리된 경향을 뜻합니다. "
-            "점수만으로 정답 k가 자동 결정되지는 않습니다."
-        )
-
-    except Exception:
-        st.info(
-            "현재 데이터에서는 실루엣 점수를 "
-            "계산할 수 없습니다."
-        )
-
-
-# 8. 결과 해석
-st.subheader("7. 분석 결과 해석")
-
-st.markdown(
-    """
-    아래 내용을 직접 확인해 보고서에 작성하세요.
-
-    1. 평균 누적 관객이 가장 큰 군집은 어느 군집인가요?
-    2. 스크린 수 평균과 10위권 일수 평균이 큰 군집은
-       각각 어느 군집인가요?
-    3. 엘보우 그래프에서 감소폭이 눈에 띄게 작아지는
-       지점은 어디인가요?
-    4. 군집마다 대표 영화가 어떤 공통점을 보이나요?
-
-    **주의:** 군집 이름은 분석자가 평균과 대표 영화를
-    읽고 붙입니다. 알고리즘이 붙인 군집 번호 자체에는
-    순위나 작품성의 의미가 없습니다.
-    """
-)
-
-st.caption(
-    "데이터 출처: 영화진흥위원회(KOBIS) 데이터 파일을 "
-    "수업 자료에서 제공한 URL로 불러옵니다."
-)
+점수 = silhouette_score(Xs, 번호)
+st.metric(f"묶음 {k}개일 때의 실루엣 점수", f"{점수:.3f}")
+st.caption("실루엣 점수는 -1에서 1 사이이고, 1에 가까울수록 묶음이 뚜렷하다는 뜻입니다. "
+           "점수가 가장 높은 묶음 수와 사람이 이해하기 좋은 묶음 수가 늘 같지는 않습니다.")
